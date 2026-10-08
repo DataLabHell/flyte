@@ -17,6 +17,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -47,6 +48,10 @@ const (
 	DisableUsageStatsStartParameter    = "disable-usage-stats"
 	DisableUsageStatsStartParameterVal = "true"
 	RayHeadContainerName               = "ray-head"
+	// ExistingClusterKey is the task config key holding the name of an existing RayCluster in the
+	// execution namespace.
+	ExistingClusterKey    = "ray.existing_cluster"
+	rayClusterSelectorKey = "ray.io/cluster"
 )
 
 var logTemplateRegexes = struct {
@@ -86,10 +91,18 @@ func (rayJobResourceHandler) BuildResource(ctx context.Context, taskCtx pluginsC
 		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "nil task specification")
 	}
 
-	rayJob := plugins.RayJob{}
-	err = utils.UnmarshalStruct(taskTemplate.GetCustom(), &rayJob) //nolint: staticcheck
+	clusterSelector, err := existingClusterSelector(taskTemplate)
 	if err != nil {
-		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "invalid TaskSpecification [%v], Err: [%v]", taskTemplate.GetCustom(), err.Error())
+		return nil, err
+	}
+
+	// A selector job may carry no custom at all: it has no cluster spec, and the SDK drops an empty RayJob.
+	rayJob := plugins.RayJob{}
+	if taskTemplate.GetCustom() != nil || clusterSelector == nil {
+		err = utils.UnmarshalStruct(taskTemplate.GetCustom(), &rayJob) //nolint: staticcheck
+		if err != nil {
+			return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "invalid TaskSpecification [%v], Err: [%v]", taskTemplate.GetCustom(), err.Error())
+		}
 	}
 
 	podSpec, objectMeta, primaryContainerName, err := flytek8s.ToK8sPodSpec(ctx, taskCtx)
@@ -113,6 +126,13 @@ func (rayJobResourceHandler) BuildResource(ctx context.Context, taskCtx pluginsC
 	}
 
 	cfg := GetConfig()
+
+	if clusterSelector != nil {
+		if !cfg.AllowExistingCluster {
+			return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "existing Ray clusters are disabled by the ray plugin config (allowExistingCluster)")
+		}
+		return constructSelectorRayJob(taskCtx, &rayJob, objectMeta, *primaryContainer, clusterSelector)
+	}
 
 	// Copy rather than alias: the resolved map is filled in below and handed to the RayJob CR, so
 	// aliasing would let one task's start params edit the shared plugin config and every other CR
@@ -339,35 +359,23 @@ func constructRayJob(ctx context.Context, taskCtx pluginsCore.TaskExecutionConte
 		ttlSecondsAfterFinished = &rayJob.TtlSecondsAfterFinished
 	}
 
-	submissionMode := rayv1.K8sJobMode
-	switch cfg.SubmissionMode {
-	case string(rayv1.HTTPMode):
-		submissionMode = rayv1.HTTPMode
-	case string(rayv1.SidecarMode):
-		submissionMode = rayv1.SidecarMode
-	case string(rayv1.K8sJobMode), "":
-		// submissionMode already defaults to K8sJobMode
-	default:
-		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "invalid ray submission mode %q: must be K8sJobMode, HTTPMode or SidecarMode", cfg.SubmissionMode)
+	submissionMode, err := resolveSubmissionMode(cfg.SubmissionMode)
+	if err != nil {
+		return nil, err
 	}
 
 	// A submitter pod only exists in K8sJobMode; in HTTPMode the KubeRay operator
 	// submits the job directly to the head node, so no template is needed.
 	var submitterPodTemplate *v1.PodTemplateSpec
 	if submissionMode == rayv1.K8sJobMode {
-		template := buildSubmitterPodTemplate(&rayClusterSpec, taskCtx)
+		// Use the image of the Ray head to be defensive against version mismatch issues
+		template := buildSubmitterPodTemplate(rayClusterSpec.HeadGroupSpec.Template.Spec.Containers[0].Image, taskCtx)
 		submitterPodTemplate = &template
 	}
 
-	// TODO: This is for backward compatibility. Remove this block once runtime_env is removed from ray proto.
-	var runtimeEnvYaml string
-	runtimeEnvYaml = rayJob.RuntimeEnvYaml
-	// If runtime_env exists but runtime_env_yaml does not, convert runtime_env to runtime_env_yaml
-	if rayJob.RuntimeEnv != "" && rayJob.RuntimeEnvYaml == "" { //nolint: staticcheck
-		runtimeEnvYaml, err = convertBase64RuntimeEnvToYaml(rayJob.RuntimeEnv) //nolint: staticcheck
-		if err != nil {
-			return nil, err
-		}
+	runtimeEnvYaml, err := resolveRuntimeEnvYAML(rayJob)
+	if err != nil {
+		return nil, err
 	}
 
 	jobSpec := rayv1.RayJobSpec{
@@ -388,6 +396,123 @@ func constructRayJob(ctx context.Context, taskCtx pluginsCore.TaskExecutionConte
 		Spec:       jobSpec,
 		ObjectMeta: *objectMeta,
 	}, nil
+}
+
+// existingClusterSelector returns the clusterSelector for the named RayCluster, or nil if unset. The
+// name is read from TaskTemplate.config, then from the container config, where the Flyte 2 SDK's
+// config() hook writes it. KubeRay resolves the selector only by ray.io/cluster, as a cluster name.
+func existingClusterSelector(taskTemplate *core.TaskTemplate) (map[string]string, error) {
+	name := taskTemplate.GetConfig()[ExistingClusterKey]
+	if name == "" {
+		for _, kv := range taskTemplate.GetContainer().GetConfig() {
+			if kv.GetKey() == ExistingClusterKey {
+				name = kv.GetValue()
+			}
+		}
+	}
+	if name == "" {
+		return nil, nil
+	}
+	if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "task config %q must be a RayCluster name, got %q: %s", ExistingClusterKey, name, strings.Join(errs, "; "))
+	}
+	return map[string]string{rayClusterSelectorKey: name}, nil
+}
+
+// constructSelectorRayJob builds a RayJob that runs the task as the driver on the existing RayCluster
+// matched by clusterSelector. KubeRay never deletes a selected cluster, so shutdown and TTL stay unset.
+func constructSelectorRayJob(taskCtx pluginsCore.TaskExecutionContext, rayJob *plugins.RayJob, objectMeta *metav1.ObjectMeta, primaryContainer v1.Container, clusterSelector map[string]string) (*rayv1.RayJob, error) {
+	submissionMode, err := resolveSubmissionMode(GetConfig().SubmissionMode)
+	if err != nil {
+		return nil, err
+	}
+	if submissionMode == rayv1.SidecarMode {
+		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "ray submission mode SidecarMode cannot target an existing RayCluster: use K8sJobMode or HTTPMode")
+	}
+
+	var submitterPodTemplate *v1.PodTemplateSpec
+	if submissionMode == rayv1.K8sJobMode {
+		template := buildSubmitterPodTemplate(primaryContainer.Image, taskCtx)
+		submitterPodTemplate = &template
+	}
+
+	runtimeEnvYaml, err := resolveRuntimeEnvYAML(rayJob)
+	if err != nil {
+		return nil, err
+	}
+	runtimeEnvYaml, err = withDriverEnv(runtimeEnvYaml, primaryContainer.Env)
+	if err != nil {
+		return nil, err
+	}
+
+	return &rayv1.RayJob{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       KindRayJob,
+			APIVersion: rayv1.SchemeGroupVersion.String(),
+		},
+		Spec: rayv1.RayJobSpec{
+			ClusterSelector:      clusterSelector,
+			Entrypoint:           strings.Join(primaryContainer.Args, " "),
+			RuntimeEnvYAML:       runtimeEnvYaml,
+			SubmitterPodTemplate: submitterPodTemplate,
+			SubmissionMode:       submissionMode,
+		},
+		ObjectMeta: *objectMeta,
+	}, nil
+}
+
+// withDriverEnv adds the task container's literal env vars to the runtime env's env_vars. The driver
+// runs on the selected cluster's head rather than in the task pod, so it only sees env passed this way.
+// Entries already in env_vars take precedence; env vars sourced via valueFrom are not forwarded.
+func withDriverEnv(runtimeEnvYaml string, env []v1.EnvVar) (string, error) {
+	runtimeEnv := map[string]interface{}{}
+	if err := yaml.Unmarshal([]byte(runtimeEnvYaml), &runtimeEnv); err != nil {
+		return "", flyteerr.Errorf(flyteerr.BadTaskSpecification, "invalid runtime_env_yaml: %v", err)
+	}
+
+	envVars := map[string]string{}
+	for _, e := range env {
+		if e.ValueFrom == nil {
+			envVars[e.Name] = e.Value
+		}
+	}
+	if existing, ok := runtimeEnv["env_vars"].(map[interface{}]interface{}); ok {
+		for k, v := range existing {
+			envVars[fmt.Sprint(k)] = fmt.Sprint(v)
+		}
+	}
+	if len(envVars) == 0 {
+		return runtimeEnvYaml, nil
+	}
+	runtimeEnv["env_vars"] = envVars
+
+	out, err := yaml.Marshal(runtimeEnv)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func resolveSubmissionMode(mode string) (rayv1.JobSubmissionMode, error) {
+	switch mode {
+	case string(rayv1.HTTPMode):
+		return rayv1.HTTPMode, nil
+	case string(rayv1.SidecarMode):
+		return rayv1.SidecarMode, nil
+	case string(rayv1.K8sJobMode), "":
+		return rayv1.K8sJobMode, nil
+	default:
+		return "", flyteerr.Errorf(flyteerr.BadTaskSpecification, "invalid ray submission mode %q: must be K8sJobMode, HTTPMode or SidecarMode", mode)
+	}
+}
+
+// TODO: This is for backward compatibility. Remove this once runtime_env is removed from ray proto.
+func resolveRuntimeEnvYAML(rayJob *plugins.RayJob) (string, error) {
+	// If runtime_env exists but runtime_env_yaml does not, convert runtime_env to runtime_env_yaml
+	if rayJob.RuntimeEnv != "" && rayJob.RuntimeEnvYaml == "" { //nolint: staticcheck
+		return convertBase64RuntimeEnvToYaml(rayJob.RuntimeEnv) //nolint: staticcheck
+	}
+	return rayJob.RuntimeEnvYaml, nil
 }
 
 func convertBase64RuntimeEnvToYaml(s string) (string, error) {
@@ -553,10 +678,7 @@ func buildHeadPodTemplate(primaryContainer *v1.Container, basePodSpec *v1.PodSpe
 	return podTemplateSpec, nil
 }
 
-func buildSubmitterPodTemplate(rayClusterSpec *rayv1.RayClusterSpec, taskCtx pluginsCore.TaskExecutionContext) v1.PodTemplateSpec {
-
-	headPodSpec := rayClusterSpec.HeadGroupSpec.Template.Spec
-
+func buildSubmitterPodTemplate(image string, taskCtx pluginsCore.TaskExecutionContext) v1.PodTemplateSpec {
 	tolerations := make([]v1.Toleration, 0)
 	if config.GetK8sPluginConfig() != nil && len(config.GetK8sPluginConfig().DefaultTolerations) > 0 {
 		tolerations = append(tolerations, config.GetK8sPluginConfig().DefaultTolerations...)
@@ -567,9 +689,8 @@ func buildSubmitterPodTemplate(rayClusterSpec *rayv1.RayClusterSpec, taskCtx plu
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{
 				{
-					Name: "ray-job-submitter",
-					// Use the image of the Ray head to be defensive against version mismatch issues
-					Image:     headPodSpec.Containers[0].Image,
+					Name:      "ray-job-submitter",
+					Image:     image,
 					Resources: submitterDefaultResourceRequirements,
 				},
 			},
@@ -928,6 +1049,9 @@ func (plugin rayJobResourceHandler) GetTaskPhase(ctx context.Context, pluginCont
 		return pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "cluster is about to be suspended", info), nil
 	case rayv1.JobDeploymentStatusSuspended:
 		return pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "cluster is suspended", info), nil
+	case rayv1.JobDeploymentStatusValidationFailed:
+		failInfo := fmt.Sprintf("Invalid Ray job %s: %s", rayJob.Name, rayJob.Status.Message)
+		phaseInfo, err = pluginsCore.PhaseInfoFailure(flyteerr.BadTaskSpecification, failInfo, info), nil
 	case rayv1.JobDeploymentStatusFailed:
 		failInfo := fmt.Sprintf("Failed to run Ray job %s with error: [%s] %s", rayJob.Name, rayJob.Status.Reason, rayJob.Status.Message)
 		phaseInfo, err = pluginsCore.PhaseInfoFailure(flyteerr.TaskFailedWithError, failInfo, info), nil
@@ -974,7 +1098,8 @@ func (rayJobResourceHandler) IsTerminal(_ context.Context, resource client.Objec
 		return false, fmt.Errorf("unexpected resource type: expected *RayJob, got %T", resource)
 	}
 	status := job.Status.JobDeploymentStatus
-	return status == rayv1.JobDeploymentStatusComplete || status == rayv1.JobDeploymentStatusFailed, nil
+	return status == rayv1.JobDeploymentStatusComplete || status == rayv1.JobDeploymentStatusFailed ||
+		status == rayv1.JobDeploymentStatusValidationFailed, nil
 }
 
 // GetCompletionTime returns the end time of the RayJob
