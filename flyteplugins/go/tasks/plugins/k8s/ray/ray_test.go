@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2623,4 +2624,112 @@ func TestBuildAutoscalerOptions(t *testing.T) {
 		assert.Equal(t, "FOO", result.Env[0].Name)
 		assert.Equal(t, "bar", result.Env[0].Value)
 	})
+}
+
+func dummyExistingClusterTaskTemplate(cluster string, rayJob *plugins.RayJob) *core.TaskTemplate {
+	taskTemplate := dummyRayTaskTemplate("ray-id", rayJob)
+	taskTemplate.Config = map[string]string{ExistingClusterKey: cluster}
+	return taskTemplate
+}
+
+func TestBuildResourceRayExistingCluster(t *testing.T) {
+	originalConfig := GetConfig()
+	defer func() { assert.NoError(t, SetConfig(originalConfig)) }()
+	assert.NoError(t, config.SetK8sPluginConfig(&config.K8sPluginConfig{}))
+	baseConfig := *originalConfig
+	baseConfig.AllowExistingCluster = true
+
+	rayJob := &plugins.RayJob{
+		RuntimeEnvYaml: "pip:\n- numpy\nenv_vars:\n  Env_Var: overridden\n  OTHER: x\n",
+	}
+	sharedSelector := map[string]string{"ray.io/cluster": "shared"}
+
+	t.Run("selector job", func(t *testing.T) {
+		cfg := baseConfig
+		cfg.ShutdownAfterJobFinishes = true
+		cfg.TTLSecondsAfterFinished = 3600
+		assert.NoError(t, SetConfig(&cfg))
+
+		taskCtx := dummyRayTaskContext(dummyExistingClusterTaskTemplate("shared", rayJob), resourceRequirements, nil, "", serviceAccount)
+		obj, err := rayJobResourceHandler{}.BuildResource(context.TODO(), taskCtx)
+		require.NoError(t, err)
+		job := obj.(*rayv1.RayJob)
+
+		assert.Nil(t, job.Spec.RayClusterSpec)
+		assert.Equal(t, sharedSelector, job.Spec.ClusterSelector)
+		assert.False(t, job.Spec.ShutdownAfterJobFinishes)
+		assert.Equal(t, int32(0), job.Spec.TTLSecondsAfterFinished)
+		assert.Equal(t, "test-args", job.Spec.Entrypoint)
+
+		require.NotNil(t, job.Spec.SubmitterPodTemplate)
+		submitter := job.Spec.SubmitterPodTemplate.Spec.Containers[0]
+		assert.Equal(t, testImage, submitter.Image)
+		assert.Equal(t, submitterDefaultResourceRequirements, submitter.Resources)
+
+		var runtimeEnv map[string]interface{}
+		require.NoError(t, yaml.Unmarshal([]byte(job.Spec.RuntimeEnvYAML), &runtimeEnv))
+		assert.Equal(t, []interface{}{"numpy"}, runtimeEnv["pip"])
+		envVars := runtimeEnv["env_vars"].(map[interface{}]interface{})
+		assert.Equal(t, "overridden", envVars["Env_Var"])
+		assert.Equal(t, "x", envVars["OTHER"])
+	})
+
+	t.Run("selector job without custom", func(t *testing.T) {
+		assert.NoError(t, SetConfig(&baseConfig))
+		taskTemplate := dummyExistingClusterTaskTemplate("shared", rayJob)
+		taskTemplate.Custom = nil
+
+		taskCtx := dummyRayTaskContext(taskTemplate, resourceRequirements, nil, "", serviceAccount)
+		obj, err := rayJobResourceHandler{}.BuildResource(context.TODO(), taskCtx)
+		require.NoError(t, err)
+		job := obj.(*rayv1.RayJob)
+		assert.Nil(t, job.Spec.RayClusterSpec)
+		assert.Equal(t, sharedSelector, job.Spec.ClusterSelector)
+	})
+
+	t.Run("cluster in container config", func(t *testing.T) {
+		assert.NoError(t, SetConfig(&baseConfig))
+		taskTemplate := dummyRayTaskTemplate("ray-id", rayJob)
+		taskTemplate.GetContainer().Config = []*core.KeyValuePair{{Key: ExistingClusterKey, Value: "shared"}}
+
+		taskCtx := dummyRayTaskContext(taskTemplate, resourceRequirements, nil, "", serviceAccount)
+		obj, err := rayJobResourceHandler{}.BuildResource(context.TODO(), taskCtx)
+		require.NoError(t, err)
+		job := obj.(*rayv1.RayJob)
+		assert.Nil(t, job.Spec.RayClusterSpec)
+		assert.Equal(t, sharedSelector, job.Spec.ClusterSelector)
+	})
+
+	t.Run("disabled by config", func(t *testing.T) {
+		cfg := baseConfig
+		cfg.AllowExistingCluster = false
+		assert.NoError(t, SetConfig(&cfg))
+
+		taskCtx := dummyRayTaskContext(dummyExistingClusterTaskTemplate("shared", rayJob), resourceRequirements, nil, "", serviceAccount)
+		_, err := rayJobResourceHandler{}.BuildResource(context.TODO(), taskCtx)
+		assert.ErrorContains(t, err, "existing Ray clusters are disabled")
+	})
+
+	t.Run("invalid cluster name", func(t *testing.T) {
+		assert.NoError(t, SetConfig(&baseConfig))
+		for _, bad := range []string{"Shared_GPU", `{"ray.io/cluster":"shared"}`} {
+			taskCtx := dummyRayTaskContext(dummyExistingClusterTaskTemplate(bad, rayJob), resourceRequirements, nil, "", serviceAccount)
+			_, err := rayJobResourceHandler{}.BuildResource(context.TODO(), taskCtx)
+			assert.ErrorContains(t, err, ExistingClusterKey)
+		}
+	})
+
+	t.Run("sidecar mode rejected", func(t *testing.T) {
+		cfg := baseConfig
+		cfg.SubmissionMode = string(rayv1.SidecarMode)
+		assert.NoError(t, SetConfig(&cfg))
+
+		taskCtx := dummyRayTaskContext(dummyExistingClusterTaskTemplate("shared", rayJob), resourceRequirements, nil, "", serviceAccount)
+		_, err := rayJobResourceHandler{}.BuildResource(context.TODO(), taskCtx)
+		assert.ErrorContains(t, err, "SidecarMode")
+	})
+}
+
+func TestAllowExistingClusterDefaultsToFalse(t *testing.T) {
+	assert.False(t, defaultConfig.AllowExistingCluster)
 }

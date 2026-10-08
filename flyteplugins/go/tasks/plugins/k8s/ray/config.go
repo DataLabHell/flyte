@@ -94,6 +94,7 @@ type Config struct {
 	Defaults             DefaultConfig                 `json:"defaults" pflag:"-,Default configuration for ray jobs"`
 	EnableUsageStats     bool                          `json:"enableUsageStats" pflag:",Enable usage stats for ray jobs. These stats are submitted to usage-stats.ray.io per https://docs.ray.io/en/latest/cluster/usage-stats.html"`
 	ServiceAccount       string                        `json:"serviceAccount" pflag:",The k8s service account to run as"`
+	AllowExistingCluster bool                          `json:"allowExistingCluster" pflag:",Allow tasks to submit to an existing RayCluster via the ray.existing_cluster task config"`
 }
 
 type DefaultConfig struct {
