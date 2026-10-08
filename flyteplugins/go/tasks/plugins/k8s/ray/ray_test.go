@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/logs"
@@ -2634,7 +2635,15 @@ func dummyExistingClusterTaskTemplate(cluster string, rayJob *plugins.RayJob) *c
 	return taskTemplate
 }
 
+func stubRayServiceReader(t *testing.T, objs ...client.Object) {
+	original := rayServiceReader
+	t.Cleanup(func() { rayServiceReader = original })
+	reader := fake.NewClientBuilder().WithObjects(objs...).Build()
+	rayServiceReader = func() (client.Reader, error) { return reader, nil }
+}
+
 func TestBuildResourceRayExistingCluster(t *testing.T) {
+	stubRayServiceReader(t)
 	originalConfig := GetConfig()
 	defer func() { assert.NoError(t, SetConfig(originalConfig)) }()
 	assert.NoError(t, config.SetK8sPluginConfig(&config.K8sPluginConfig{}))
@@ -2734,4 +2743,50 @@ func TestBuildResourceRayExistingCluster(t *testing.T) {
 
 func TestAllowExistingClusterDefaultsToFalse(t *testing.T) {
 	assert.False(t, defaultConfig.AllowExistingCluster)
+}
+
+func TestBuildResourceRayExistingClusterRayService(t *testing.T) {
+	originalConfig := GetConfig()
+	defer func() { assert.NoError(t, SetConfig(originalConfig)) }()
+	assert.NoError(t, config.SetK8sPluginConfig(&config.K8sPluginConfig{}))
+	cfg := *originalConfig
+	cfg.AllowExistingCluster = true
+	assert.NoError(t, SetConfig(&cfg))
+
+	stubRayServiceReader(t,
+		&rayv1.RayService{
+			ObjectMeta: metav1.ObjectMeta{Name: "ray-inference", Namespace: "test-namespace"},
+			Status: rayv1.RayServiceStatuses{
+				ActiveServiceStatus: rayv1.RayServiceStatus{RayClusterName: "ray-inference-abcde"},
+			},
+		},
+		&rayv1.RayService{ObjectMeta: metav1.ObjectMeta{Name: "starting", Namespace: "test-namespace"}},
+	)
+
+	build := func(cluster string) (*rayv1.RayJob, error) {
+		taskCtx := dummyRayTaskContext(dummyExistingClusterTaskTemplate(cluster, &plugins.RayJob{}), resourceRequirements, nil, "", serviceAccount)
+		obj, err := rayJobResourceHandler{}.BuildResource(context.TODO(), taskCtx)
+		if err != nil {
+			return nil, err
+		}
+		return obj.(*rayv1.RayJob), nil
+	}
+
+	t.Run("rayservice name resolves to its active cluster", func(t *testing.T) {
+		job, err := build("ray-inference")
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"ray.io/cluster": "ray-inference-abcde"}, job.Spec.ClusterSelector)
+	})
+
+	t.Run("rayservice without active cluster is retried", func(t *testing.T) {
+		_, err := build("starting")
+		assert.ErrorContains(t, err, "no active RayCluster")
+		assert.NotContains(t, err.Error(), "BadTaskSpecification")
+	})
+
+	t.Run("plain cluster name passes through", func(t *testing.T) {
+		job, err := build("shared")
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"ray.io/cluster": "shared"}, job.Spec.ClusterSelector)
+	})
 }
