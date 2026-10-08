@@ -1580,6 +1580,7 @@ func TestGetTaskPhase(t *testing.T) {
 		{rayv1.JobDeploymentStatusRunning, pluginsCore.PhaseRunning, false},
 		{rayv1.JobDeploymentStatusComplete, pluginsCore.PhaseSuccess, false},
 		{rayv1.JobDeploymentStatusFailed, pluginsCore.PhasePermanentFailure, false},
+		{rayv1.JobDeploymentStatusValidationFailed, pluginsCore.PhasePermanentFailure, false},
 		{rayv1.JobDeploymentStatusSuspended, pluginsCore.PhaseQueued, false},
 		{rayv1.JobDeploymentStatusSuspending, pluginsCore.PhaseQueued, false},
 	}
@@ -2422,6 +2423,7 @@ func TestIsTerminal(t *testing.T) {
 	}{
 		{"Complete", rayv1.JobDeploymentStatusComplete, true},
 		{"Failed", rayv1.JobDeploymentStatusFailed, true},
+		{"ValidationFailed", rayv1.JobDeploymentStatusValidationFailed, true},
 		{"Running", rayv1.JobDeploymentStatusRunning, false},
 		{"Initializing", rayv1.JobDeploymentStatusInitializing, false},
 		{"Suspended", rayv1.JobDeploymentStatusSuspended, false},

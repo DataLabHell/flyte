@@ -1049,6 +1049,9 @@ func (plugin rayJobResourceHandler) GetTaskPhase(ctx context.Context, pluginCont
 		return pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "cluster is about to be suspended", info), nil
 	case rayv1.JobDeploymentStatusSuspended:
 		return pluginsCore.PhaseInfoQueuedWithTaskInfo(time.Now(), pluginsCore.DefaultPhaseVersion, "cluster is suspended", info), nil
+	case rayv1.JobDeploymentStatusValidationFailed:
+		failInfo := fmt.Sprintf("Invalid Ray job %s: %s", rayJob.Name, rayJob.Status.Message)
+		phaseInfo, err = pluginsCore.PhaseInfoFailure(flyteerr.BadTaskSpecification, failInfo, info), nil
 	case rayv1.JobDeploymentStatusFailed:
 		failInfo := fmt.Sprintf("Failed to run Ray job %s with error: [%s] %s", rayJob.Name, rayJob.Status.Reason, rayJob.Status.Message)
 		phaseInfo, err = pluginsCore.PhaseInfoFailure(flyteerr.TaskFailedWithError, failInfo, info), nil
@@ -1095,7 +1098,8 @@ func (rayJobResourceHandler) IsTerminal(_ context.Context, resource client.Objec
 		return false, fmt.Errorf("unexpected resource type: expected *RayJob, got %T", resource)
 	}
 	status := job.Status.JobDeploymentStatus
-	return status == rayv1.JobDeploymentStatusComplete || status == rayv1.JobDeploymentStatusFailed, nil
+	return status == rayv1.JobDeploymentStatusComplete || status == rayv1.JobDeploymentStatusFailed ||
+		status == rayv1.JobDeploymentStatusValidationFailed, nil
 }
 
 // GetCompletionTime returns the end time of the RayJob
