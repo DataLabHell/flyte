@@ -9,17 +9,21 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	"github.com/samber/lo"
 	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	flyteerr "github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/errors"
 	"github.com/flyteorg/flyte/v2/flyteplugins/go/tasks/logs"
@@ -53,6 +57,10 @@ const (
 	ExistingClusterKey    = "ray.existing_cluster"
 	rayClusterSelectorKey = "ray.io/cluster"
 )
+
+// rayServiceReader resolves RayService names for existing-cluster jobs. BuildResource gets no
+// Kubernetes client, so the plugin creates its own on first use.
+var rayServiceReader = sync.OnceValues(newRayServiceReader)
 
 var logTemplateRegexes = struct {
 	RayClusterName *regexp.Regexp
@@ -130,6 +138,10 @@ func (rayJobResourceHandler) BuildResource(ctx context.Context, taskCtx pluginsC
 	if clusterSelector != nil {
 		if !cfg.AllowExistingCluster {
 			return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "existing Ray clusters are disabled by the ray plugin config (allowExistingCluster)")
+		}
+		clusterSelector, err = resolveRayService(ctx, taskCtx.TaskExecutionMetadata().GetNamespace(), clusterSelector)
+		if err != nil {
+			return nil, err
 		}
 		return constructSelectorRayJob(taskCtx, &rayJob, objectMeta, *primaryContainer, clusterSelector)
 	}
@@ -417,6 +429,50 @@ func existingClusterSelector(taskTemplate *core.TaskTemplate) (map[string]string
 		return nil, flyteerr.Errorf(flyteerr.BadTaskSpecification, "task config %q must be a RayCluster name, got %q: %s", ExistingClusterKey, name, strings.Join(errs, "; "))
 	}
 	return map[string]string{rayClusterSelectorKey: name}, nil
+}
+
+// resolveRayService replaces a RayService name in the selector with the RayService's active RayCluster.
+// KubeRay resolves ray.io/cluster as a RayCluster name, and a RayService generates a new one on every
+// upgrade. Names that are not a RayService pass through.
+func resolveRayService(ctx context.Context, namespace string, clusterSelector map[string]string) (map[string]string, error) {
+	name := clusterSelector[rayClusterSelectorKey]
+	if name == "" {
+		return clusterSelector, nil
+	}
+	reader, err := rayServiceReader()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client for RayService lookup: %w", err)
+	}
+
+	rayService := &rayv1.RayService{}
+	err = reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, rayService)
+	if apierrors.IsNotFound(err) {
+		return clusterSelector, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to get RayService %s/%s: %w", namespace, name, err)
+	}
+
+	active := rayService.Status.ActiveServiceStatus.RayClusterName
+	if active == "" {
+		return nil, fmt.Errorf("RayService %s/%s has no active RayCluster yet", namespace, name)
+	}
+	resolved := maps.Clone(clusterSelector)
+	resolved[rayClusterSelectorKey] = active
+	return resolved, nil
+}
+
+func newRayServiceReader() (client.Reader, error) {
+	var restConfig *rest.Config
+	var err error
+	if remote := GetConfig().RemoteClusterConfig; remote.Enabled {
+		restConfig, err = k8s.KubeClientConfig(remote.Endpoint, remote.Auth)
+	} else {
+		restConfig, err = ctrlconfig.GetConfig()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return client.New(restConfig, client.Options{Scheme: scheme.Scheme})
 }
 
 // constructSelectorRayJob builds a RayJob that runs the task as the driver on the existing RayCluster
